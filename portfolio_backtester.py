@@ -9,7 +9,10 @@
 
 
 # %% Install dependencies (Colab only)
-# Colab already has most of these; we upgrade yfinance since its API moves around.
+# Colab already ships numpy, pandas, matplotlib, seaborn, scipy, statsmodels and
+# tabulate, so we only install yfinance (the one thing it lacks). We deliberately do
+# NOT upgrade the preinstalled libraries: doing that mid-session is the usual cause of
+# "restart the runtime" / NumPy ABI errors on the next import.
 try:
     import google.colab  # noqa: F401
     IN_COLAB = True
@@ -19,9 +22,7 @@ except Exception:
 if IN_COLAB:
     import subprocess, sys
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-         "yfinance", "pandas", "numpy", "matplotlib", "seaborn",
-         "scipy", "statsmodels", "tabulate"],
+        [sys.executable, "-m", "pip", "install", "-q", "yfinance", "tabulate"],
         check=False,
     )
 
