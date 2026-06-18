@@ -8,12 +8,18 @@
 # whole thing into one cell and run it.
 
 
-# %% Install dependencies (Colab only)
-# Installs yfinance (which Colab lacks) and refreshes the scientific stack so numpy,
-# scipy, seaborn and friends are mutually consistent. Colab's base image sometimes
-# ships a mismatched numpy/scipy that breaks "import seaborn"; reinstalling these
-# together repairs it. If Colab asks you to "Restart the runtime" after this cell,
-# do it once, then run again.
+# %% Setup (Colab only) -- installs dependencies and restarts the runtime ONCE
+#
+# Why the restart: Colab loads NumPy at startup, so when pip swaps in a newer NumPy
+# the already-loaded copy no longer matches the new files on disk. That mismatch is
+# what causes errors like "cannot import name '_center'" or "_blas_supports_fpe" when
+# scipy/seaborn import. The only reliable fix is to restart the runtime after
+# installing, so a clean, consistent NumPy loads. A sentinel file makes this happen
+# exactly once -- the second run skips the install and proceeds normally.
+#
+# So the flow is: run -> it installs and restarts -> run all cells again -> it runs.
+import sys, os
+
 try:
     import google.colab  # noqa: F401
     IN_COLAB = True
@@ -21,13 +27,20 @@ except Exception:
     IN_COLAB = False
 
 if IN_COLAB:
-    import subprocess, sys
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--upgrade",
-         "numpy", "scipy", "pandas", "matplotlib", "seaborn",
-         "statsmodels", "tabulate", "yfinance"],
-        check=False,
-    )
+    import subprocess
+    _SETUP_DONE = "/content/_bt_setup_done"
+    if not os.path.exists(_SETUP_DONE):
+        print("Installing dependencies (one-time, ~30-60s)...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+             "numpy", "scipy", "pandas", "matplotlib", "seaborn",
+             "statsmodels", "tabulate", "yfinance"],
+            check=False,
+        )
+        open(_SETUP_DONE, "w").close()
+        print("Dependencies ready. Restarting the runtime so the new NumPy loads cleanly.")
+        print(">>> When it reconnects, run the cell again (or Runtime > Run all). <<<")
+        os.kill(os.getpid(), 9)   # hard restart; Colab auto-reconnects, /content persists
 
 
 # %% Imports and global setup
@@ -75,7 +88,7 @@ def section(title):
 # %% CUSTOM PORTFOLIO INPUTS  -- this is the only section you need to edit
 
 # Portfolio: 10-20 tickers
-TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
+TICKERS = ["AAPL", "MSFT", "NVDA", "MRVL", "GOOGL",
            "META", "AVGO", "TSLA", "JPM", "V"]
 
 BENCHMARK = "SPY"
@@ -86,12 +99,12 @@ END_DATE   = "2024-12-31"
 INITIAL_INVESTMENT = 100_000.0
 
 # "equal", "market_cap", or "custom"
-WEIGHTING_METHOD = "equal"
+WEIGHTING_METHOD = "custom"
 
 # Only used when WEIGHTING_METHOD == "custom". Values are normalized automatically,
 # so they don't need to add up to 1. Anything left out gets a weight of 0.
 CUSTOM_WEIGHTS = {
-    "AAPL": 0.15, "MSFT": 0.15, "NVDA": 0.15, "AMZN": 0.10, "GOOGL": 0.10,
+    "AAPL": 0.15, "MSFT": 0.15, "NVDA": 0.15, "MRVL": 0.10, "GOOGL": 0.10,
     "META": 0.10, "AVGO": 0.05, "TSLA": 0.05, "JPM": 0.10, "V": 0.05,
 }
 
