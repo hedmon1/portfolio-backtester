@@ -68,6 +68,7 @@ plt.rcParams.update({
 })
 
 TRADING_DAYS = 252
+MIN_STOCKS, MAX_STOCKS = 5, 20     # supported portfolio size (checked at run time)
 pd.set_option("display.float_format", lambda x: f"{x:,.4f}")
 
 # pandas 2.2 renamed the resample aliases (M->ME, Q->QE, A->YE). Colab ships a recent
@@ -87,7 +88,7 @@ def section(title):
 
 # %% CUSTOM PORTFOLIO INPUTS  -- this is the only section you need to edit
 
-# Portfolio: 10-20 tickers
+# Portfolio: 5 to 20 tickers (the engine checks this range and tells you if you're off).
 TICKERS = ["AAPL", "MSFT", "NVDA", "MRVL", "GOOGL",
            "META", "AVGO", "TSLA", "JPM", "V"]
 
@@ -101,8 +102,12 @@ INITIAL_INVESTMENT = 100_000.0
 # "equal", "market_cap", or "custom"
 WEIGHTING_METHOD = "custom"
 
-# Only used when WEIGHTING_METHOD == "custom". Values are normalized automatically,
-# so they don't need to add up to 1. Anything left out gets a weight of 0.
+# Only used when WEIGHTING_METHOD == "custom". Give one weight per ticker above.
+# Tips (the engine checks all of this and prints clear warnings):
+#   - They are normalized to total 100%, so 0.15 / 0.30 etc. are treated as proportions.
+#     Easiest is to make them add up to 1.0 (or 100) so the numbers match what you see.
+#   - Every ticker in TICKERS should have a weight here; any you leave out gets 0%.
+#   - Keys here that aren't in TICKERS are ignored.
 CUSTOM_WEIGHTS = {
     "AAPL": 0.15, "MSFT": 0.15, "NVDA": 0.15, "MRVL": 0.10, "GOOGL": 0.10,
     "META": 0.10, "AVGO": 0.05, "TSLA": 0.05, "JPM": 0.10, "V": 0.05,
@@ -138,37 +143,175 @@ CONFIG = dict(
 )
 
 
+# %% Validate inputs -- catches common mistakes and explains them in plain English
+
+def validate_config(cfg):
+    """Check and clean the user inputs, printing clear warnings for anything off.
+
+    Returns a corrected copy of cfg. Only raises (with a friendly message) for problems
+    that make a backtest impossible -- everything else is fixed with a heads-up so a run
+    never dies on a typo.
+    """
+    cfg = dict(cfg)
+    notes = []   # collected warnings, shown together at the end
+
+    # Tickers: clean, de-duplicate, and drop the benchmark if it slipped into the list.
+    seen, tickers = set(), []
+    for t in cfg["tickers"]:
+        t = str(t).upper().strip()
+        if t and t not in seen:
+            seen.add(t)
+            tickers.append(t)
+    if cfg["benchmark"] in tickers:
+        tickers.remove(cfg["benchmark"])
+        notes.append(f"Removed {cfg['benchmark']} from the portfolio -- it's the benchmark "
+                     f"you're comparing against, not a holding.")
+
+    # Portfolio size: aim for MIN_STOCKS..MAX_STOCKS.
+    if len(tickers) > MAX_STOCKS:
+        notes.append(f"You listed {len(tickers)} tickers; using the first {MAX_STOCKS} "
+                     f"(the supported maximum).")
+        tickers = tickers[:MAX_STOCKS]
+    if len(tickers) < 2:
+        raise ValueError(f"Need at least 2 valid tickers to run a portfolio "
+                         f"(you have {len(tickers)}). Add more to TICKERS.")
+    if len(tickers) < MIN_STOCKS:
+        notes.append(f"Only {len(tickers)} tickers -- below the recommended {MIN_STOCKS}. "
+                     f"It will still run, but diversification stats will be thin.")
+    cfg["tickers"] = tickers
+
+    # Weighting method.
+    if cfg["weighting"] not in ("equal", "market_cap", "custom"):
+        notes.append(f"Unknown weighting '{cfg['weighting']}' -- using equal weight.")
+        cfg["weighting"] = "equal"
+
+    # Custom weights: the part people trip on. Reconcile against the ticker list and
+    # explain the normalization instead of silently rescaling.
+    if cfg["weighting"] == "custom":
+        cw = {k.upper().strip(): float(v) for k, v in cfg["custom_weights"].items()}
+        neg = [k for k, v in cw.items() if v < 0]
+        if neg:
+            notes.append(f"Negative custom weight(s) set to 0: {', '.join(neg)}.")
+            cw = {k: max(v, 0.0) for k, v in cw.items()}
+        missing = [t for t in tickers if t not in cw]
+        extra = [k for k in cw if k not in tickers]
+        if missing:
+            notes.append(f"No custom weight for {', '.join(missing)} -- they'll get 0%. "
+                         f"Add them to CUSTOM_WEIGHTS if that isn't intended.")
+        if extra:
+            notes.append(f"Ignoring custom weight(s) for tickers not in your list: "
+                         f"{', '.join(extra)}.")
+        used = {t: cw.get(t, 0.0) for t in tickers}
+        raw_sum = sum(used.values())
+        if raw_sum <= 0:
+            notes.append("All custom weights are 0 -- using equal weight instead.")
+            cfg["weighting"] = "equal"
+        elif abs(raw_sum - 1.0) > 0.01:
+            notes.append(
+                f"Custom weights total {raw_sum * 100:.1f}%, not 100%, so they'll be "
+                f"scaled to 100% (each divided by {raw_sum:.3f}). That's why a typed 15% "
+                f"can show up smaller. To make displayed weights match what you type, edit "
+                f"them to add up to 1.0.")
+        cfg["custom_weights"] = used
+
+    # Rebalancing.
+    if cfg["rebalance"] not in ("none", "monthly", "quarterly", "yearly"):
+        notes.append(f"Unknown rebalance '{cfg['rebalance']}' -- using 'none'.")
+        cfg["rebalance"] = "none"
+
+    # Dates.
+    try:
+        start, end = pd.to_datetime(cfg["start"]), pd.to_datetime(cfg["end"])
+    except Exception:
+        raise ValueError("START_DATE / END_DATE must be dates like '2019-01-01'.")
+    if start >= end:
+        raise ValueError(f"START_DATE ({cfg['start']}) must be before END_DATE ({cfg['end']}).")
+    if (end - start).days < 90:
+        notes.append("Date range is under ~3 months; many statistics need more history "
+                     "to mean much.")
+
+    # Money, rates, costs, simulation count.
+    if cfg["initial"] <= 0:
+        raise ValueError("INITIAL_INVESTMENT must be a positive number.")
+    if not (0 <= cfg["rf"] < 1):
+        notes.append(f"RISK_FREE_RATE is {cfg['rf']} -- expected a decimal like 0.04 (=4%). "
+                     f"Did you enter a percent by mistake?")
+    if not (0 <= cfg["cost"] < 0.1):
+        notes.append(f"TRANSACTION_COST is {cfg['cost']} -- expected a small fraction like "
+                     f"0.001 (=0.1%). Double-check the value.")
+    if cfg["mc_sims"] < 1000:
+        notes.append(f"MC_SIMULATIONS is low ({cfg['mc_sims']}); 10,000+ is smoother.")
+
+    section("0. Configuration check")
+    for n in notes:
+        print(f"  - {n}")
+    if not notes:
+        print("  looks good -- no issues found.")
+    print(f"  running: {len(cfg['tickers'])} tickers, {cfg['weighting']} weighting, "
+          f"{cfg['rebalance']} rebalancing, {cfg['start']} to {cfg['end']}")
+    return cfg
+
+
 # %% Data collection
 
-def download_prices(tickers, start, end, max_missing_pct=0.10):
+def download_prices(tickers, start, end, max_missing_pct=0.10, attempts=3):
     """Download adjusted-close prices and volume, dropping anything too patchy.
 
     auto_adjust=True gives split/dividend-adjusted closes, which is what we want for
-    total-return backtesting. Tickers missing more than max_missing_pct of their data
-    are dropped; the rest are forward/back-filled so returns are well defined.
+    total-return backtesting. Yahoo sometimes returns nothing on the first try, so we
+    retry a few times and raise a clear, friendly error if no usable data comes back.
+    Tickers with too many gaps (or none at all) are reported and skipped.
     """
+    import time
     if isinstance(tickers, str):
         tickers = [tickers]
+    requested = list(tickers)
 
-    raw = yf.download(tickers, start=start, end=end,
-                      auto_adjust=True, progress=False, group_by="column")
+    raw = None
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = yf.download(tickers, start=start, end=end, auto_adjust=True,
+                              progress=False, group_by="column")
+            if raw is not None and not raw.empty:
+                break
+        except Exception as e:
+            print(f"  download attempt {attempt}/{attempts} failed: {e}")
+        if attempt < attempts:
+            time.sleep(2)
+
+    if raw is None or raw.empty:
+        raise RuntimeError(
+            "Yahoo Finance returned no data. This is usually a temporary rate limit -- "
+            "wait a minute and run the cell again. Also double-check your tickers and that "
+            "the dates aren't in the future.")
 
     # yfinance returns a different shape for one vs. many tickers, so handle both.
     if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" not in raw.columns.get_level_values(0):
+            raise RuntimeError("Downloaded data has no 'Close' prices -- check your tickers.")
         prices = raw["Close"].copy()
         has_vol = "Volume" in raw.columns.get_level_values(0)
         volume = raw["Volume"].copy() if has_vol else pd.DataFrame()
     else:
         prices = raw[["Close"]].copy()
-        prices.columns = tickers
-        volume = raw[["Volume"]].copy()
-        volume.columns = tickers
+        prices.columns = requested[:1]
+        volume = raw[["Volume"]].copy() if "Volume" in raw.columns else pd.DataFrame()
+        if not volume.empty:
+            volume.columns = requested[:1]
 
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame()
     prices = prices.dropna(how="all")
-    volume = volume.reindex(columns=prices.columns)
+    if not volume.empty:
+        volume = volume.reindex(columns=prices.columns)
+
+    # Tickers that came back with no data at all -- usually a typo or a delisting.
+    invalid = [t for t in requested if t not in prices.columns]
+    if invalid:
+        print(f"  no data for {', '.join(invalid)} (check spelling / availability) -- skipping")
 
     # Drop tickers with too many gaps.
-    keep, dropped = [], []
+    keep, dropped = [], list(invalid)
     for col in prices.columns:
         missing = prices[col].isna().mean()
         if missing > max_missing_pct:
@@ -177,11 +320,16 @@ def download_prices(tickers, start, end, max_missing_pct=0.10):
         else:
             keep.append(col)
     prices = prices[keep]
-    volume = volume.reindex(columns=keep)
+
+    if prices.shape[1] == 0:
+        raise RuntimeError(
+            "None of the requested tickers had usable data for this date range. Check the "
+            "tickers and that the dates aren't in the future, then run again.")
 
     # Fill the small remaining gaps.
     prices = prices.ffill().bfill()
-    volume = volume.ffill().fillna(0)
+    if not volume.empty:
+        volume = volume.reindex(columns=keep).ffill().fillna(0)
     return prices, volume, dropped
 
 
@@ -342,6 +490,8 @@ def beta_alpha(returns, bench_returns, rf=0.0, periods_per_year=TRADING_DAYS):
     rf_daily = rf / periods_per_year
     df = pd.concat([returns, bench_returns], axis=1).dropna()
     df.columns = ["p", "b"]
+    if len(df) < 3 or df["b"].std() == 0:   # too few points / flat benchmark -> undefined
+        return np.nan, np.nan, np.nan
     y = df["p"] - rf_daily
     X = sm.add_constant(df["b"] - rf_daily)
     model = sm.OLS(y, X).fit()
@@ -676,19 +826,20 @@ def make_all_charts(prices, port_value, bench_value, weights, mc_results,
     ax.set_title(f"Rolling {roll}-Day Annualized Volatility"); ax.set_ylabel("Volatility %")
     ax.legend(); plt.tight_layout(); plt.show()
 
-    # 6. Monthly returns heatmap
+    # 6. Monthly returns heatmap (needs at least a couple of months of history)
     m = port_value.resample(RS_M).last().pct_change().dropna() * 100
-    heat = m.to_frame("ret")
-    heat["Year"] = heat.index.year
-    heat["Month"] = heat.index.strftime("%b")
-    pivot = heat.pivot_table(index="Year", columns="Month", values="ret")
-    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    pivot = pivot.reindex(columns=[mo for mo in month_order if mo in pivot.columns])
-    fig, ax = plt.subplots(figsize=(12, max(3, 0.6 * len(pivot))))
-    sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0,
-                linewidths=0.5, cbar_kws={"label": "Return %"}, ax=ax)
-    ax.set_title("Monthly Returns Heatmap (%)"); plt.tight_layout(); plt.show()
+    if len(m) >= 2:
+        heat = m.to_frame("ret")
+        heat["Year"] = heat.index.year
+        heat["Month"] = heat.index.strftime("%b")
+        pivot = heat.pivot_table(index="Year", columns="Month", values="ret")
+        month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        pivot = pivot.reindex(columns=[mo for mo in month_order if mo in pivot.columns])
+        fig, ax = plt.subplots(figsize=(12, max(3, 0.6 * len(pivot))))
+        sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0,
+                    linewidths=0.5, cbar_kws={"label": "Return %"}, ax=ax)
+        ax.set_title("Monthly Returns Heatmap (%)"); plt.tight_layout(); plt.show()
 
     # 7. Correlation matrix
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -749,16 +900,18 @@ def make_all_charts(prices, port_value, bench_value, weights, mc_results,
     ax.set_title("Cumulative Return: Portfolio vs SPY"); ax.set_ylabel("Cumulative return %")
     ax.legend(); plt.tight_layout(); plt.show()
 
-    # 14. Annual returns
-    fig, ax = plt.subplots()
+    # 14. Annual returns (needs at least one full year-over-year change)
     p_ann = port_value.resample(RS_Y).last().pct_change().dropna() * 100
     b_ann = bench_value.resample(RS_Y).last().pct_change().dropna() * 100
-    ann = pd.DataFrame({"Portfolio": p_ann, "SPY": b_ann})
-    ann.index = ann.index.year
-    ann.plot(kind="bar", ax=ax, color=["#1f4e79", "#c0392b"])
-    ax.axhline(0, color="gray", lw=1)
-    ax.set_title("Annual Returns: Portfolio vs SPY"); ax.set_ylabel("Return %"); ax.set_xlabel("Year")
-    plt.tight_layout(); plt.show()
+    ann = pd.DataFrame({"Portfolio": p_ann, "SPY": b_ann}).dropna(how="all")
+    if len(ann):
+        fig, ax = plt.subplots()
+        ann.index = ann.index.year
+        ann.plot(kind="bar", ax=ax, color=["#1f4e79", "#c0392b"])
+        ax.axhline(0, color="gray", lw=1)
+        ax.set_title("Annual Returns: Portfolio vs SPY")
+        ax.set_ylabel("Return %"); ax.set_xlabel("Year")
+        plt.tight_layout(); plt.show()
 
 
 # %% Written report and grade
@@ -877,15 +1030,23 @@ def generate_report(metrics, bench_extras, beat, verdict, leaderboard,
 def run_backtest(cfg):
     print("Portfolio backtester")
 
+    cfg = validate_config(cfg)
+
     section("1. Downloading price data")
     prices, volume, dropped = download_prices(cfg["tickers"], cfg["start"], cfg["end"])
     if prices.shape[1] < 2:
-        raise RuntimeError("Fewer than 2 tickers survived data cleaning, stopping.")
+        raise RuntimeError(
+            "Fewer than 2 tickers had usable data, so there's no portfolio to test. "
+            "Check the tickers and dates, then run again.")
     bench_raw, _, _ = download_prices(cfg["benchmark"], cfg["start"], cfg["end"])
     bench_prices = bench_raw.iloc[:, 0]
 
     # Line up the portfolio and benchmark on shared trading days.
     common = prices.index.intersection(bench_prices.index)
+    if len(common) < 30:
+        raise RuntimeError(
+            "Portfolio and benchmark barely overlap in time (under 30 shared trading days). "
+            "Widen your date range or check the tickers.")
     prices, bench_prices = prices.loc[common], bench_prices.loc[common]
     print(f"  universe: {list(prices.columns)}")
     print(f"  period:   {prices.index[0].date()} to {prices.index[-1].date()} "
@@ -911,12 +1072,17 @@ def run_backtest(cfg):
     print(tabulate(metric_table, headers="keys", tablefmt="github", floatfmt=",.3f"))
 
     pr = to_returns(port_value)
-    roll_1y_ret = (port_value / port_value.shift(cfg["roll"]) - 1).dropna() * 100
-    roll_vol = (pr.rolling(cfg["roll"]).std() * np.sqrt(TRADING_DAYS) * 100).dropna()
-    roll_sharpe = ((pr.rolling(cfg["roll"]).mean() - cfg["rf"] / TRADING_DAYS)
-                   / pr.rolling(cfg["roll"]).std() * np.sqrt(TRADING_DAYS)).dropna()
-    print(f"\n  latest rolling 1Y: return {roll_1y_ret.iloc[-1]:.2f}%, "
-          f"vol {roll_vol.iloc[-1]:.2f}%, Sharpe {roll_sharpe.iloc[-1]:.2f}")
+    if len(port_value) > cfg["roll"]:
+        roll_1y_ret = (port_value / port_value.shift(cfg["roll"]) - 1).dropna() * 100
+        roll_vol = (pr.rolling(cfg["roll"]).std() * np.sqrt(TRADING_DAYS) * 100).dropna()
+        roll_sharpe = ((pr.rolling(cfg["roll"]).mean() - cfg["rf"] / TRADING_DAYS)
+                       / pr.rolling(cfg["roll"]).std() * np.sqrt(TRADING_DAYS)).dropna()
+        if len(roll_1y_ret) and len(roll_vol) and len(roll_sharpe):
+            print(f"\n  latest rolling 1Y: return {roll_1y_ret.iloc[-1]:.2f}%, "
+                  f"vol {roll_vol.iloc[-1]:.2f}%, Sharpe {roll_sharpe.iloc[-1]:.2f}")
+    else:
+        print(f"\n  (not enough history for 1-year rolling stats -- need more than "
+              f"{cfg['roll']} trading days)")
 
     section("4. Benchmark comparison")
     comp_table, bench_extras, beat, verdict = benchmark_comparison(
@@ -969,10 +1135,6 @@ def run_backtest(cfg):
     print(f"  best contributing sector:  {sector_df['Contribution %'].idxmax()}")
     print(f"  worst contributing sector: {sector_df['Contribution %'].idxmin()}")
 
-    section("9. Charts")
-    make_all_charts(prices, port_value, bench_value, weights, mc_results,
-                    sector_df, leaderboard, cfg["rf"], cfg["roll"])
-
     grade = grade_portfolio(metrics, beat, bench_extras["Outperformance % (total)"])
     report = generate_report(metrics, bench_extras, beat, verdict, leaderboard,
                              sector_df, mc_results, dd_table, grade)
@@ -993,6 +1155,14 @@ def run_backtest(cfg):
         ["Grade",                    f"{grade[0]} ({grade[1]}/6)"],
     ]
     print(tabulate(summary, headers=["Metric", "Value"], tablefmt="github"))
+
+    # Charts last, so even if one fails to draw you still have every number above.
+    section("9. Charts")
+    try:
+        make_all_charts(prices, port_value, bench_value, weights, mc_results,
+                        sector_df, leaderboard, cfg["rf"], cfg["roll"])
+    except Exception as e:
+        print(f"  (charts skipped due to an error: {e})")
 
     # Hand everything back so you can poke at the objects after a run.
     return dict(
