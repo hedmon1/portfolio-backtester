@@ -4,7 +4,7 @@
 
 A single-file portfolio backtesting engine that runs in Google Colab with no setup. Edit one inputs section, run all cells, and get a full research report: performance and risk metrics, a benchmark comparison, a per-stock leaderboard, a Monte Carlo forecast, sector analysis, charts, and a written summary with a final grade.
 
-Click the **Open in Colab** badge above to run it in your browser — nothing to install.
+Click the **Open in Colab** badge above to run it in your browser
 
 ## Quick start
 
